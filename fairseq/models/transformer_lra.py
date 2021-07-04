@@ -161,9 +161,9 @@ class TransformerLRAModel(FairseqEncoderModel):
             src_tokens = src_tokens[:, 1:]
         sentence_rep = self.encoder(src_tokens)
         if not self.use_p:
-            sentence_rep = sentence_rep[1]
+            sentence_rep = sentence_rep[1][0]
         else:
-            sentence_rep = sentence_rep[2].mean(dim=0)
+            sentence_rep = sentence_rep[1][1].mean(dim=0)
         if 'net_input1' in sample:
             src1_tokens = sample['net_input1']
             sentence1_rep = self.encoder(src1_tokens)
@@ -270,7 +270,7 @@ class TransformerLRAEncoder(FairseqEncoder):
         else:
             self.encoder = LunaSentenceEncoder(
                 tie_layer_weights=getattr(args, 'tie_layer_weights', False),
-                projected_length=args.encoder_projected_length,
+                projection_length=args.encoder_projected_length,
                 padding_idx=task.dictionary.pad_index,
                 vocab_size=len(task.dictionary),
                 num_encoder_layers=args.encoder_layers,

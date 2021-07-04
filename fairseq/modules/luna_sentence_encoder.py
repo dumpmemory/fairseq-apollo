@@ -32,6 +32,8 @@ class LunaSentenceEncoderLayer(nn.Module):
         attention_dropout: float = 0.1,
         activation_dropout: float = 0.1,
         activation_fn: str = 'relu',
+        normalize_before: bool = False,
+        share_qkv=False,
         export: bool = False,
         q_noise: float = 0.0,
         qn_block_size: int = 8,
@@ -54,11 +56,13 @@ class LunaSentenceEncoderLayer(nn.Module):
             num_attention_heads,
             num_projected_attention_heads,
             dropout=attention_dropout,
+            share_qkv=share_qkv,
             q_noise=q_noise,
             qn_block_size=qn_block_size,
         )
 
         # layer norm associated with the self attention layer
+        self.normalize_before = normalize_before
         self.self_attn_layer_norm = LayerNorm(self.embedding_dim, export=export)
         self.self_atten_proj_layer_norm = LayerNorm(self.embedding_dim, export=export)
 
@@ -80,6 +84,7 @@ class LunaSentenceEncoderLayer(nn.Module):
         num_attention_heads,
         num_projected_attention_heads,
         dropout,
+        share_qkv,
         q_noise,
         qn_block_size,
     ):
@@ -89,6 +94,7 @@ class LunaSentenceEncoderLayer(nn.Module):
             num_projected_attention_heads,
             dropout=dropout,
             self_attention=True,
+            share_qkv=share_qkv,
             q_noise=q_noise,
             qn_block_size=qn_block_size,
         )
@@ -97,7 +103,8 @@ class LunaSentenceEncoderLayer(nn.Module):
         self,
         x: torch.Tensor,
         px: torch.Tensor,
-        self_attn_padding_mask: Optional[torch.Tensor] = None,
+        x_padding_mask: Optional[torch.Tensor] = None,
+        px_padding_mask: Optional[torch.Tensor] = None,
     ):
         """
         LayerNorm is applied either before or after the self-attention/ffn
@@ -105,23 +112,43 @@ class LunaSentenceEncoderLayer(nn.Module):
         """
         residual = x
         presidual = px
+        # apply prev layer norm
+        if self.normalize_before:
+            x = self.self_attn_layer_norm(x)
+            px = self.self_atten_proj_layer_norm(px)
+
         x, px, attn = self.self_attn(query=x, pquery=px, context=x,
-                                     context_padding_mask=self_attn_padding_mask,
+                                     context_padding_mask=x_padding_mask,
+                                     pcontext_padding_mask=px_padding_mask,
                                      need_weights=False)
         # apply dropout
         x = self.dropout_module(x)
         px = self.dropout_module(px)
-        # apply layer norm
-        x = self.self_attn_layer_norm(residual + x)
-        px = self.self_atten_proj_layer_norm(presidual + px)
+        # residual
+        x = residual + x
+        px = presidual + px
 
+        # apply post layer norm
+        if not self.normalize_before:
+            x = self.self_attn_layer_norm(x)
+            px = self.self_atten_proj_layer_norm(px)
+
+        #######################################################################
+        # Feed-Forward Network
         residual = x
+        # apply prev layer norm
+        if self.normalize_before:
+            x = self.final_layer_norm(x)
+
         x = self.activation_fn(self.fc1(x))
         x = self.activation_dropout_module(x)
         x = self.fc2(x)
         x = self.dropout_module(x)
         x = residual + x
-        x = self.final_layer_norm(x)
+
+        # apply post layer norm
+        if not self.normalize_before:
+            x = self.final_layer_norm(x)
         return x, px, attn
 
 
@@ -152,8 +179,8 @@ def init_bert_params(module):
     if isinstance(module, LunarMultiheadAttention):
         module.q_proj.weight.data.normal_(mean=0.0, std=0.02)
         module.pq_proj.weight.data.normal_(mean=0.0, std=0.02)
-        module.c_proj.weight.data.normal_(mean=0.0, std=0.02)
-        module.pc_proj.weight.data.normal_(mean=0.0, std=0.02)
+        # module.c_proj.weight.data.normal_(mean=0.0, std=0.02)
+        # module.pc_proj.weight.data.normal_(mean=0.0, std=0.02)
 
 
 class LunaSentenceEncoder(nn.Module):
@@ -184,7 +211,7 @@ class LunaSentenceEncoder(nn.Module):
         self,
         padding_idx: int,
         vocab_size: int,
-        projected_length: int,
+        projection_length: int,
         num_encoder_layers: int = 6,
         embedding_dim: int = 768,
         ffn_embedding_dim: int = 3072,
@@ -199,6 +226,9 @@ class LunaSentenceEncoder(nn.Module):
         use_position_embeddings: bool = True,
         offset_positions_by_padding: bool = True,
         layernorm_embedding: bool = False,
+        normalize_before: bool = False,
+        dynamic_projection: bool = True,
+        share_qkv=False,
         apply_bert_init: bool = False,
         activation_fn: str = "relu",
         learned_pos_embedding: bool = True,
@@ -217,7 +247,8 @@ class LunaSentenceEncoder(nn.Module):
         super().__init__()
         self.padding_idx = padding_idx
         self.vocab_size = vocab_size
-        self.proj_len = projected_length
+        self.proj_len = projection_length
+        self.dynamic_projection = dynamic_projection
         self.dropout_module = FairseqDropout(dropout, module_name=self.__class__.__name__)
         self.layerdrop = layerdrop
         self.max_seq_len = max_seq_len
@@ -284,6 +315,8 @@ class LunaSentenceEncoder(nn.Module):
                     attention_dropout=attention_dropout,
                     activation_dropout=activation_dropout,
                     activation_fn=activation_fn,
+                    normalize_before=normalize_before,
+                    share_qkv=share_qkv,
                     export=export,
                     q_noise=q_noise,
                     qn_block_size=qn_block_size,
@@ -301,6 +334,8 @@ class LunaSentenceEncoder(nn.Module):
                     attention_dropout=attention_dropout,
                     activation_dropout=activation_dropout,
                     activation_fn=activation_fn,
+                    normalize_before=normalize_before,
+                    share_qkv=share_qkv,
                     export=export,
                     q_noise=q_noise,
                     qn_block_size=qn_block_size,
@@ -308,12 +343,41 @@ class LunaSentenceEncoder(nn.Module):
                 for _ in range(num_encoder_layers)
             ])
 
+
+        # self.layers.extend([
+        #     self.build_luna_sentence_encoder_layer(
+        #         embedding_dim=self.embedding_dim,
+        #         ffn_embedding_dim=ffn_embedding_dim,
+        #         num_attention_heads=num_attention_heads,
+        #         num_projected_attention_heads=num_projected_attention_heads,
+        #         dropout=self.dropout_module.p,
+        #         attention_dropout=attention_dropout,
+        #         activation_dropout=activation_dropout,
+        #         activation_fn=activation_fn,
+        #         normalize_before=normalize_before,
+        #         share_qkv=share_qkv,
+        #         export=export,
+        #         q_noise=q_noise,
+        #         qn_block_size=qn_block_size,
+        #     )
+        #     for _ in range(num_encoder_layers)
+        # ])
+
+        assert not layernorm_embedding or not normalize_before
+
         if layernorm_embedding:
             self.emb_layer_norm = LayerNorm(self.embedding_dim, export=export)
             self.proj_emb_layer_norm = LayerNorm(self.embedding_dim, export=export)
         else:
             self.emb_layer_norm = None
             self.proj_emb_layer_norm = None
+
+        if normalize_before:
+            self.layer_norm = LayerNorm(self.embedding_dim, export=export)
+            self.proj_layer_norm = LayerNorm(self.embedding_dim, export=export)
+        else:
+            self.layer_norm = None
+            self.proj_layer_norm = None
 
         # Apply initialization of model params after building the model
         if self.apply_bert_init:
@@ -350,6 +414,8 @@ class LunaSentenceEncoder(nn.Module):
         attention_dropout,
         activation_dropout,
         activation_fn,
+        normalize_before,
+        share_qkv,
         export,
         q_noise,
         qn_block_size,
@@ -363,6 +429,8 @@ class LunaSentenceEncoder(nn.Module):
             attention_dropout=attention_dropout,
             activation_dropout=activation_dropout,
             activation_fn=activation_fn,
+            normalize_before=normalize_before,
+            share_qkv=share_qkv,
             export=export,
             q_noise=q_noise,
             qn_block_size=qn_block_size,
@@ -377,24 +445,27 @@ class LunaSentenceEncoder(nn.Module):
         segment_labels: torch.Tensor = None,
         last_state_only: bool = False,
         positions: Optional[torch.Tensor] = None,
-    ) -> Tuple[List[Tuple[torch.Tensor, torch.Tensor]], torch.Tensor, torch.Tensor]:
+    ) -> Tuple[List[Tuple[torch.Tensor, torch.Tensor]],
+               Tuple[torch.Tensor, torch.Tensor],
+               Tuple[torch.Tensor, torch.Tensor]]:
 
         # compute padding mask. This is needed for multi-head attention
-        padding_mask = tokens.eq(self.padding_idx)
-        if not self.traceable and not self.tpu and not padding_mask.any():
-            padding_mask = None
+        # B x T
+        x_padding_mask = tokens.eq(self.padding_idx)
+        lengths = tokens.size(1) - x_padding_mask.sum(1)
+        max_len = lengths.max() if self.dynamic_projection else self.proj_len
 
         x = self.embed_tokens(tokens)
-        px = self.projected_embeddings
+        px = self.projected_embeddings[:max_len]
 
         if self.embed_scale is not None:
-            x = x * self.embed_scale
-            px = px * self.embed_scale
+            x *= self.embed_scale
+            px *= self.embed_scale
 
         if self.embed_positions is not None:
             x += self.embed_positions(tokens, positions=positions)
         if self.projected_positions is not None:
-            px += self.projected_positions
+            px += self.projected_positions[:max_len]
 
         if self.segment_embeddings is not None and segment_labels is not None:
             x += self.segment_embeddings(segment_labels)
@@ -406,36 +477,60 @@ class LunaSentenceEncoder(nn.Module):
             x = self.emb_layer_norm(x)
             px = self.proj_emb_layer_norm(px)
 
+        bsz = x.size(0)
+        len, dim = px.size()
+        # L x C -> B x L x C
+        px = px.unsqueeze(0).expand(bsz, len, dim)
+
+        if self.dynamic_projection:
+            pidx = torch.arange(len).unsqueeze(0).to(x.device)
+            # B x L
+            px_padding_mask = pidx.ge(lengths.unsqueeze(1))
+        else:
+            px_padding_mask = None
+
+        if not self.traceable and not self.tpu:
+            if not x_padding_mask.any():
+                x_padding_mask = None
+            if px_padding_mask is not None and not px_padding_mask.any():
+                px_padding_mask = None
+
         x = self.dropout_module(x)
         px = self.dropout_module(px)
 
         # account for padding while computing the representation
-        if padding_mask is not None:
-            x *= 1 - padding_mask.unsqueeze(-1).type_as(x)
+        if x_padding_mask is not None:
+            x = x * (1 - x_padding_mask.unsqueeze(-1).type_as(x))
+        if px_padding_mask is not None:
+            px = px * (1 - px_padding_mask.unsqueeze(-1).type_as(px))
 
-        bsz = x.size(0)
-        len, dim = px.size()
         # B x T x C -> T x B x C
         x = x.transpose(0, 1)
-        # L x C -> L x B x C
-        px = px.unsqueeze(1).expand(len, bsz, dim)
+        # B x L x C -> L x B x C
+        px = px.transpose(0, 1)
 
         inner_states = []
         if not last_state_only:
             inner_states.append((x, px))
-        
+
         for i in range(self.num_layers):
             if self.tie_layer_weights:
-                x, px, _ = self.layers[0](x, px, self_attn_padding_mask=padding_mask)
+                x, px, _ = self.layers[0](x, px,
+                             x_padding_mask=x_padding_mask,
+                             px_padding_mask=px_padding_mask)
             else:
-                x, px, _ = self.layers[i](x, px, self_attn_padding_mask=padding_mask)
+                x, px, _ = self.layers[i](x, px,
+                             x_padding_mask=x_padding_mask,
+                             px_padding_mask=px_padding_mask)
             if not last_state_only:
                 inner_states.append((x, px))
 
-        # for layer in self.layers:
-        #     x, px, _ = layer(x, px, self_attn_padding_mask=padding_mask)
-        #     if not last_state_only:
-        #         inner_states.append((x, px))
+            if not last_state_only:
+                inner_states.append((x, px))
+
+        if self.layer_norm is not None:
+            x = self.layer_norm(x)
+            px = self.proj_layer_norm(px)
 
         if self.sen_rep_type == 'cls':
             sentence_cls_rep = x[0, :, :]
@@ -446,7 +541,7 @@ class LunaSentenceEncoder(nn.Module):
         if last_state_only:
             inner_states = [(x, px)]
 
-        return inner_states, sentence_cls_rep, sentence_proj_rep
+        return inner_states, (sentence_cls_rep, sentence_proj_rep), (x_padding_mask, px_padding_mask)
 
 
 def get_sinusoidal_positional_embedding(length, embed_dim):

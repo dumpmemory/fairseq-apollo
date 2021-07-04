@@ -30,6 +30,7 @@ class LunarMultiheadAttention(nn.Module):
         bias=True,
         self_attention=False,
         encoder_decoder_attention=False,
+        share_qkv=False,
         q_noise=0.0,
         qn_block_size=8,
     ):
@@ -48,11 +49,19 @@ class LunarMultiheadAttention(nn.Module):
 
         self.self_attention = self_attention
         self.encoder_decoder_attention = encoder_decoder_attention
+        self.share_qkv = share_qkv
 
-        self.pq_proj = quant_noise(nn.Linear(embed_dim, embed_dim, bias=bias), q_noise, qn_block_size)
+        self.k_proj = quant_noise(nn.Linear(embed_dim, embed_dim, bias=bias), q_noise, qn_block_size)
+        self.v_proj = quant_noise(nn.Linear(embed_dim, embed_dim, bias=bias), q_noise, qn_block_size)
         self.q_proj = quant_noise(nn.Linear(embed_dim, embed_dim, bias=bias), q_noise, qn_block_size)
-        self.pc_proj = quant_noise(nn.Linear(embed_dim, embed_dim, bias=bias), q_noise, qn_block_size)
-        self.c_proj = quant_noise(nn.Linear(embed_dim, embed_dim, bias=bias), q_noise, qn_block_size)
+        if self.share_qkv:
+            self.pk_proj = self.k_proj
+            self.pv_proj = self.v_proj
+            self.pq_proj = self.q_proj
+        else:
+            self.pk_proj = quant_noise(nn.Linear(embed_dim, embed_dim, bias=bias), q_noise, qn_block_size)
+            self.pv_proj = quant_noise(nn.Linear(embed_dim, embed_dim, bias=bias), q_noise, qn_block_size)
+            self.pq_proj = quant_noise(nn.Linear(embed_dim, embed_dim, bias=bias), q_noise, qn_block_size)
         self.out_proj = quant_noise(nn.Linear(embed_dim, embed_dim, bias=bias), q_noise, qn_block_size)
         self.reset_parameters()
 
@@ -71,69 +80,66 @@ class LunarMultiheadAttention(nn.Module):
         # Empirically observed the convergence to be much better with
         # the scaled initialization
         gain = 1.0 / math.sqrt(2.0)
-        nn.init.xavier_uniform_(self.pq_proj.weight, gain=gain)
-        if self.pq_proj.bias is not None:
-            nn.init.constant_(self.pq_proj.bias, 0.)
+        nn.init.xavier_uniform_(self.k_proj.weight, gain=gain)
+        nn.init.xavier_uniform_(self.v_proj.weight, gain=gain)
         nn.init.xavier_uniform_(self.q_proj.weight, gain=gain)
-        if self.q_proj.bias is not None:
-            nn.init.constant_(self.q_proj.bias, 0.)
-        nn.init.xavier_uniform_(self.pc_proj.weight, gain=gain)
-        if self.pc_proj.bias is not None:
-            nn.init.constant_(self.pc_proj.bias, 0.)
-        nn.init.xavier_uniform_(self.c_proj.weight, gain=gain)
-        if self.c_proj.bias is not None:
-            nn.init.constant_(self.c_proj.bias, 0.)
+
+        if not self.share_qkv:
+            nn.init.xavier_uniform_(self.pk_proj.weight, gain=gain)
+            nn.init.xavier_uniform_(self.pv_proj.weight, gain=gain)
+            nn.init.xavier_uniform_(self.pq_proj.weight, gain=gain)
 
         nn.init.xavier_uniform_(self.out_proj.weight)
         if self.out_proj.bias is not None:
             nn.init.constant_(self.out_proj.bias, 0.)
 
     def _compute_pcontext_singlehead(self, pquery, context, context_padding_mask):
-        c = self.c_proj(context)
         # N x B x D -> B x D x N
-        k = c.permute(1, 2, 0)
+        k = self.pk_proj(context).permute(1, 2, 0)
         # N x B x D -> B x N x D
-        v = c.transpose(0, 1)
+        v = self.pv_proj(context).transpose(0, 1)
 
         # L x B x D -> B x L x D
         pq = self.pq_proj(pquery).transpose(0, 1) * self.pscaling
         # B x L x N
-        pqc = pq.matmul(k)
+        pqk = torch.bmm(pq, k)
         if context_padding_mask is not None:
-            pqc = pqc.masked_fill(context_padding_mask.unsqueeze(1).to(torch.bool), float("-inf"))
-        pqc = F.softmax(pqc, dim=-1)
-        pqc = self.dropout_module(pqc)
+            pqk = pqk.masked_fill(context_padding_mask.unsqueeze(1).to(torch.bool), float("-inf"))
+        pqk = F.softmax(pqk, dim=-1)
+        pqk = self.dropout_module(pqk)
         # B x L x D -> L x B x D
-        pc = torch.bmm(pqc, v).transpose(0, 1)
+        pc = torch.bmm(pqk, v).transpose(0, 1)
         return pc
 
     def _compute_pcontext_multiheads(self, pquery, context, context_padding_mask):
         # N x B x D
         len, bsz, dim = context.size()
-        c = self.c_proj(context)
-        # N x B x D -> N x B x H x K
-        k = v = c.view(len, bsz, self.num_pheads, self.phead_dim)
-        # N x B x H x K -> B x H x K x N
-        k = k.permute(1, 2, 3, 0)
-        # N x B x H x K -> B x H x N x K
-        v = v.permute(1, 2, 0, 3)
+        # N x B x D -> N x B*H x K
+        k = self.pk_proj(context).view(len, bsz * self.num_pheads, self.phead_dim)
+        v = self.pv_proj(context).view(len, bsz * self.num_pheads, self.phead_dim)
+        # N x B*H x K -> B*H x K x N
+        k = k.permute(1, 2, 0)
+        # N x B*H x K -> B*H x N x K
+        v = v.transpose(0, 1)
 
         plen = pquery.size(0)
-        # L x B x D -> L x B x H x K
-        pq = self.pq_proj(pquery).view(plen, -1, self.num_pheads, self.phead_dim)
-        # L x B x H x K -> B x H x L x K
-        pq = pq.permute(1, 2, 0, 3) * self.pscaling
-        # B x H x L x N
-        pqc = pq.matmul(k)
+        # L x B x D -> L x B*H x K
+        pq = self.pq_proj(pquery).view(plen, bsz * self.num_pheads, self.phead_dim)
+        # L x B*H x K -> B*H x L x K
+        pq = pq.transpose(0, 1) * self.pscaling
+        # B*H x L x N
+        pqk = torch.bmm(pq, k)
         if context_padding_mask is not None:
-            pqc = pqc.masked_fill(context_padding_mask.unsqueeze(1).unsqueeze(2).to(torch.bool), float("-inf"))
-        pqc = F.softmax(pqc, dim=-1)
-        pqc = self.dropout_module(pqc)
-        # B x H x L x K
-        pc = torch.matmul(pqc, v)
-        # B x H x L x K -> L x B x H x K
-        pc = pc.permute(2, 0, 1, 3).contiguous()
-        pc = pc.view(plen, bsz, dim)
+            pqk = pqk.view(bsz, self.num_pheads, plen, len)
+            pqk = pqk.masked_fill(context_padding_mask.unsqueeze(1).unsqueeze(2).to(torch.bool), float("-inf"))
+            pqk = pqk.view(bsz * self.num_pheads, plen, len)
+
+        pqk = F.softmax(pqk, dim=-1)
+        pqk = self.dropout_module(pqk)
+        # B*H x L x K
+        pc = torch.bmm(pqk, v)
+        # B*H x L x K -> L x B*H x K -> L x B x D
+        pc = pc.transpose(0, 1).contiguous().view(plen, bsz, dim)
         return pc
 
     def compute_pcontext(self,
@@ -159,6 +165,7 @@ class LunarMultiheadAttention(nn.Module):
         pquery,
         context: Optional[Tensor],
         context_padding_mask: Optional[Tensor] = None,
+        pcontext_padding_mask: Optional[Tensor] = None,
         incremental_state: Optional[Dict[str, Dict[str, Optional[Tensor]]]] = None,
         need_weights: bool = False,
         static_context: bool = False,
@@ -200,14 +207,16 @@ class LunarMultiheadAttention(nn.Module):
         # L x B x D
         pcontext = self.compute_pcontext(query, pquery, context, context_padding_mask,
                                          incremental_state, static_context)
-        key_padding_mask = None
+
+        key_padding_mask = pcontext_padding_mask
 
         q = self.q_proj(query)
         if pcontext is None:
             assert context is None
             k = v = None
         else:
-            k = v = self.pc_proj(pcontext).view(-1, bsz * self.num_heads, self.head_dim).transpose(0, 1)
+            k = self.k_proj(pcontext).view(-1, bsz * self.num_heads, self.head_dim).transpose(0, 1)
+            v = self.v_proj(pcontext).view(-1, bsz * self.num_heads, self.head_dim).transpose(0, 1)
 
         q = q * self.scaling
         q = q.contiguous().view(tgt_len, bsz * self.num_heads, self.head_dim).transpose(0, 1)
@@ -242,21 +251,10 @@ class LunarMultiheadAttention(nn.Module):
                     pcontext = prev_pcontext
                 else:
                     raise RuntimeError('pcontext error')
-            prev_key_padding_mask: Optional[Tensor] = None
-            if "prev_key_padding_mask" in saved_state:
-                prev_key_padding_mask = saved_state["prev_key_padding_mask"]
-            assert k is not None and v is not None and pcontext is not None
-            key_padding_mask = LunarMultiheadAttention._append_prev_key_padding_mask(
-                key_padding_mask=key_padding_mask,
-                prev_key_padding_mask=prev_key_padding_mask,
-                batch_size=bsz,
-                src_len=k.size(1),
-                static_kv=static_context,
-            )
 
+            assert k is not None and v is not None and pcontext is not None
             saved_state["prev_key"] = k.view(bsz, self.num_heads, -1, self.head_dim)
             saved_state["prev_value"] = v.view(bsz, self.num_heads, -1, self.head_dim)
-            saved_state["prev_key_padding_mask"] = key_padding_mask
             saved_state["prev_pcontext"] = pcontext.transpose(0, 1)
             # In this branch incremental_state is never None
             assert incremental_state is not None
@@ -311,44 +309,6 @@ class LunarMultiheadAttention(nn.Module):
                 attn_weights = attn_weights.mean(dim=0)
 
         return attn, pcontext, attn_weights
-
-    @staticmethod
-    def _append_prev_key_padding_mask(
-        key_padding_mask: Optional[Tensor],
-        prev_key_padding_mask: Optional[Tensor],
-        batch_size: int,
-        src_len: int,
-        static_kv: bool,
-    ) -> Optional[Tensor]:
-        # saved key padding masks have shape (bsz, seq_len)
-        if prev_key_padding_mask is not None and static_kv:
-            new_key_padding_mask = prev_key_padding_mask
-        elif prev_key_padding_mask is not None and key_padding_mask is not None:
-            new_key_padding_mask = torch.cat(
-                [prev_key_padding_mask.float(), key_padding_mask.float()], dim=1
-            )
-        # During incremental decoding, as the padding token enters and
-        # leaves the frame, there will be a time when prev or current
-        # is None
-        elif prev_key_padding_mask is not None:
-            filler = torch.zeros(
-                (batch_size, src_len - prev_key_padding_mask.size(1)),
-                device=prev_key_padding_mask.device,
-            )
-            new_key_padding_mask = torch.cat(
-                [prev_key_padding_mask.float(), filler.float()], dim=1
-            )
-        elif key_padding_mask is not None:
-            filler = torch.zeros(
-                (batch_size, src_len - key_padding_mask.size(1)),
-                device=key_padding_mask.device,
-            )
-            new_key_padding_mask = torch.cat(
-                [filler.float(), key_padding_mask.float()], dim=1
-            )
-        else:
-            new_key_padding_mask = prev_key_padding_mask
-        return new_key_padding_mask
 
     @torch.jit.export
     def reorder_incremental_state(
@@ -431,6 +391,7 @@ class LunarCausalAttention(nn.Module):
         num_heads,
         dropout=0.0,
         bias=True,
+        share_qkv=False,
         q_noise=0.0,
         qn_block_size=8,
         parallel=True,
@@ -444,11 +405,18 @@ class LunarCausalAttention(nn.Module):
         self.head_dim = embed_dim // num_heads
         assert (self.head_dim * num_heads == self.embed_dim), "embed_dim must be divisible by num_heads"
         self.scaling = self.head_dim ** -0.5
+        self.share_qkv = share_qkv
 
-        self.pq_proj = quant_noise(nn.Linear(embed_dim, embed_dim, bias=bias), q_noise, qn_block_size)
-        self.q_proj = quant_noise(nn.Linear(embed_dim, embed_dim, bias=bias), q_noise, qn_block_size)
         self.k_proj = quant_noise(nn.Linear(embed_dim, embed_dim, bias=bias), q_noise, qn_block_size)
         self.v_proj = quant_noise(nn.Linear(embed_dim, embed_dim, bias=bias), q_noise, qn_block_size)
+        self.q_proj = quant_noise(nn.Linear(embed_dim, embed_dim, bias=bias), q_noise, qn_block_size)
+        if self.share_qkv:
+            self.pk_proj = self.k_proj
+            self.pq_proj = self.q_proj
+        else:
+            self.pk_proj = quant_noise(nn.Linear(embed_dim, embed_dim, bias=bias), q_noise, qn_block_size)
+            self.pq_proj = quant_noise(nn.Linear(embed_dim, embed_dim, bias=bias), q_noise, qn_block_size)
+
         self.out_proj = quant_noise(nn.Linear(embed_dim, embed_dim, bias=bias), q_noise, qn_block_size)
         self.reset_parameters()
 
@@ -467,18 +435,13 @@ class LunarCausalAttention(nn.Module):
         # Empirically observed the convergence to be much better with
         # the scaled initialization
         gain = 1.0 / math.sqrt(2.0)
-        nn.init.xavier_uniform_(self.pq_proj.weight, gain=gain)
-        if self.pq_proj.bias is not None:
-            nn.init.constant_(self.pq_proj.bias, 0.)
-        nn.init.xavier_uniform_(self.q_proj.weight, gain=gain)
-        if self.q_proj.bias is not None:
-            nn.init.constant_(self.q_proj.bias, 0.)
         nn.init.xavier_uniform_(self.k_proj.weight, gain=gain)
-        if self.k_proj.bias is not None:
-            nn.init.constant_(self.k_proj.bias, 0.)
         nn.init.xavier_uniform_(self.v_proj.weight, gain=gain)
-        if self.v_proj.bias is not None:
-            nn.init.constant_(self.v_proj.bias, 0.)
+        nn.init.xavier_uniform_(self.q_proj.weight, gain=gain)
+
+        if not self.share_qkv:
+            nn.init.xavier_uniform_(self.pk_proj.weight, gain=gain)
+            nn.init.xavier_uniform_(self.pq_proj.weight, gain=gain)
 
         nn.init.xavier_uniform_(self.out_proj.weight)
         if self.out_proj.bias is not None:
@@ -488,7 +451,7 @@ class LunarCausalAttention(nn.Module):
         # N x B x D
         len, bsz, dim = key.size()
         # N x B x D -> N x B*H x K
-        k = key.contiguous().view(len, bsz * self.num_heads, self.head_dim)
+        k = self.pk_proj(key).view(len, bsz * self.num_heads, self.head_dim)
         # N x B*H x K -> B*H x N x K
         k = k.transpose(0, 1)
         # B x H x L x K -> B*H x L x K -> B*H x K x L
@@ -503,6 +466,7 @@ class LunarCausalAttention(nn.Module):
         query,
         pquery,
         key_padding_mask: Optional[Tensor] = None,
+        pkey_padding_mask: Optional[Tensor] = None,
         incremental_state: Optional[Dict[str, Dict[str, Optional[Tensor]]]] = None,
         need_weights: bool = False,
         need_head_weights: bool = False,
@@ -511,6 +475,9 @@ class LunarCausalAttention(nn.Module):
         Args:
             key_padding_mask (ByteTensor, optional): mask to exclude
                 keys that are pads, of shape `(batch, src_len)`, where
+                padding elements are indicated by 1s.
+            pkey_padding_mask (ByteTensor, optional): mask to exclude
+                keys that are pads, of shape `(batch, proj_len)`, where
                 padding elements are indicated by 1s.
             need_weights (bool, optional): return the attention weights,
                 averaged over heads (default: False).
@@ -522,7 +489,6 @@ class LunarCausalAttention(nn.Module):
             need_weights = True
 
         tgt_len, bsz, embed_dim = query.size()
-        plen = pquery.size(0)
         assert embed_dim == self.embed_dim
 
         pq = None
@@ -541,15 +507,16 @@ class LunarCausalAttention(nn.Module):
             value_accum_mat = None
 
         if pq is None:
+            plen = pquery.size(0)
             # L x B x D -> L x B x H x K
             pq = self.pq_proj(pquery).view(plen, bsz, self.num_heads, self.head_dim)
             # L x B x H x K -> B x H x L x K
             pq = pq.permute(1, 2, 0, 3) * self.scaling
 
+        plen = pq.size(2)
         # B*H x N x L
         pattn_weights = self._compute_pattention(pq, query, key_padding_mask)
         pattn_weights = self.dropout_module(pattn_weights)
-        key_padding_mask = None
 
         q = self.q_proj(query) * self.scaling
         k = self.k_proj(query)
@@ -574,23 +541,14 @@ class LunarCausalAttention(nn.Module):
             if "prev_num_steps" in saved_state:
                 _prev_num_steps = saved_state["prev_num_steps"]
                 num_steps = _prev_num_steps.view(bsz * self.num_heads) + 1.0
-            prev_key_padding_mask: Optional[Tensor] = None
-            if "prev_key_padding_mask" in saved_state:
-                prev_key_padding_mask = saved_state["prev_key_padding_mask"]
-            key_padding_mask = LunarCausalAttention._append_prev_key_padding_mask(
-                key_padding_mask=key_padding_mask,
-                prev_key_padding_mask=prev_key_padding_mask,
-                batch_size=bsz,
-                src_len=k.size(1),
-            )
 
         if num_steps is None:
             num_steps = query.new_ones(bsz * self.num_heads)
 
         # This is part of a workaround to get around fork/join parallelism
         # not supporting Optional types.
-        if key_padding_mask is not None and key_padding_mask.dim() == 0:
-            key_padding_mask = None
+        if pkey_padding_mask is not None and pkey_padding_mask.dim() == 0:
+            pkey_padding_mask = None
 
         if incremental_state is not None:
             attn_weights, key_accum_mat = incremental_causal_attention(q, k, pattn_weights, key_accum_mat, num_steps)
@@ -598,6 +556,17 @@ class LunarCausalAttention(nn.Module):
             attn_weights = efficient_causal_attention(q, k, pattn_weights)
 
         assert list(attn_weights.size()) == [bsz * self.num_heads, tgt_len, plen]
+
+        if pkey_padding_mask is not None:
+            # don't attend to padding symbols
+            attn_weights = attn_weights.view(bsz, self.num_heads, tgt_len, plen)
+            if not self.tpu:
+                attn_weights = attn_weights.masked_fill(pkey_padding_mask.unsqueeze(1).unsqueeze(2).to(torch.bool), float("-inf"))
+            else:
+                attn_weights = attn_weights.transpose(0, 2)
+                attn_weights = attn_weights.masked_fill(pkey_padding_mask, float('-inf'))
+                attn_weights = attn_weights.transpose(0, 2)
+            attn_weights = attn_weights.view(bsz * self.num_heads, tgt_len, plen)
 
         attn_weights_float = utils.softmax(attn_weights, dim=-1, onnx_trace=self.onnx_trace)
         attn_weights = attn_weights_float.type_as(attn_weights)
@@ -613,7 +582,6 @@ class LunarCausalAttention(nn.Module):
             saved_state["prev_key_accum_mat"] = key_accum_mat.view(bsz, self.num_heads, self.head_dim, plen)
             saved_state["prev_value_accum_mat"] = value_accum_mat.view(bsz, self.num_heads, plen, self.head_dim)
             saved_state["prev_num_steps"] = num_steps.view(bsz, self.num_heads)
-            saved_state["prev_key_padding_mask"] = key_padding_mask
             # In this branch incremental_state is never None
             assert incremental_state is not None
             incremental_state = self._set_input_buffer(incremental_state, saved_state)
@@ -634,41 +602,6 @@ class LunarCausalAttention(nn.Module):
                 attn_weights = attn_weights.mean(dim=0)
 
         return attn, attn_weights
-
-    @staticmethod
-    def _append_prev_key_padding_mask(
-        key_padding_mask: Optional[Tensor],
-        prev_key_padding_mask: Optional[Tensor],
-        batch_size: int,
-        src_len: int,
-    ) -> Optional[Tensor]:
-        # saved key padding masks have shape (bsz, seq_len)
-        if prev_key_padding_mask is not None and key_padding_mask is not None:
-            new_key_padding_mask = torch.cat(
-                [prev_key_padding_mask.float(), key_padding_mask.float()], dim=1
-            )
-        # During incremental decoding, as the padding token enters and
-        # leaves the frame, there will be a time when prev or current
-        # is None
-        elif prev_key_padding_mask is not None:
-            filler = torch.zeros(
-                (batch_size, src_len - prev_key_padding_mask.size(1)),
-                device=prev_key_padding_mask.device,
-            )
-            new_key_padding_mask = torch.cat(
-                [prev_key_padding_mask.float(), filler.float()], dim=1
-            )
-        elif key_padding_mask is not None:
-            filler = torch.zeros(
-                (batch_size, src_len - key_padding_mask.size(1)),
-                device=key_padding_mask.device,
-            )
-            new_key_padding_mask = torch.cat(
-                [filler.float(), key_padding_mask.float()], dim=1
-            )
-        else:
-            new_key_padding_mask = prev_key_padding_mask
-        return new_key_padding_mask
 
     @torch.jit.export
     def reorder_incremental_state(
@@ -767,6 +700,7 @@ def efficient_causal_attention_parallel(x, y, z):
         x (Tensor): Tensor with shape `(batch, n, d1)`
         y (Tensor): Tensor with shape `(batch, n, d1)`
         z (Tensor): Tensor with shape '(batch, n, d2)`
+
     return:
     """
     bsz, n, d1 = x.size()
