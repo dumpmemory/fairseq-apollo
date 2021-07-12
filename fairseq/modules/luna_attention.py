@@ -1,5 +1,3 @@
-# Copyright (c) Facebook, Inc. and its affiliates.
-#
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 
@@ -450,8 +448,8 @@ class LunarCausalAttention(nn.Module):
 
         # B x H x L x K -> B*H x L x K -> B*H x K x L
         pq = pq.view(bsz * self.num_heads, -1, self.head_dim).transpose(1, 2)
-        # B*H x N x L
-        pattn = k.bmm(pq)
+        # B*H x N x L -> N x B*H x L
+        pattn = k.bmm(pq).transpose(0, 1)
         pattn = F.elu(pattn) + 1.0
         return pattn
 
@@ -508,19 +506,19 @@ class LunarCausalAttention(nn.Module):
             pq = pq.permute(1, 2, 0, 3) * self.scaling
 
         plen = pq.size(2)
-        # B*H x N x L
+        # N x B*H x L
         pattn_weights = self._compute_pattention(pq, query, key_padding_mask)
         pattn_weights = self.dropout_module(pattn_weights)
 
-        # N x B x D -> B*H x N x K
+        # N x B x D -> N x B*H x K
         q = self.q_proj(query) * self.scaling
-        q = q.view(tgt_len, bsz * self.num_heads, self.head_dim).transpose(0, 1)
-        # N x B x D -> B*H x N x K
+        q = q.view(tgt_len, bsz * self.num_heads, self.head_dim)
+        # N x B x D -> N x B*H x K
         if self.c_proj is not None:
-            k = v = self.c_proj(query).view(tgt_len, bsz * self.num_heads, self.head_dim).transpose(0, 1)
+            k = v = self.c_proj(query).view(tgt_len, bsz * self.num_heads, self.head_dim)
         else:
-            k = self.k_proj(query).view(tgt_len, bsz * self.num_heads, self.head_dim).transpose(0, 1)
-            v = self.v_proj(query).view(tgt_len, bsz * self.num_heads, self.head_dim).transpose(0, 1)
+            k = self.k_proj(query).view(tgt_len, bsz * self.num_heads, self.head_dim)
+            v = self.v_proj(query).view(tgt_len, bsz * self.num_heads, self.head_dim)
 
         efficient_causal_attention = efficient_causal_attention_parallel if self.parallel else efficient_causal_attention_seq
 
@@ -550,18 +548,18 @@ class LunarCausalAttention(nn.Module):
         else:
             attn_weights = efficient_causal_attention(q, k, pattn_weights)
 
-        assert list(attn_weights.size()) == [bsz * self.num_heads, tgt_len, plen]
+        assert list(attn_weights.size()) == [tgt_len, bsz * self.num_heads, plen]
 
         if pkey_padding_mask is not None:
             # don't attend to padding symbols
-            attn_weights = attn_weights.view(bsz, self.num_heads, tgt_len, plen)
+            attn_weights = attn_weights.view(tgt_len, bsz, self.num_heads, plen)
             if not self.tpu:
-                attn_weights = attn_weights.masked_fill(pkey_padding_mask.unsqueeze(1).unsqueeze(2).to(torch.bool), float("-inf"))
+                attn_weights = attn_weights.masked_fill(pkey_padding_mask.unsqueeze(1).unsqueeze(0).to(torch.bool), float("-inf"))
             else:
-                attn_weights = attn_weights.transpose(0, 2)
+                attn_weights = attn_weights.transpose(1, 2)
                 attn_weights = attn_weights.masked_fill(pkey_padding_mask, float('-inf'))
-                attn_weights = attn_weights.transpose(0, 2)
-            attn_weights = attn_weights.view(bsz * self.num_heads, tgt_len, plen)
+                attn_weights = attn_weights.transpose(1, 2)
+            attn_weights = attn_weights.view(tgt_len, bsz * self.num_heads, plen)
 
         attn_weights_float = utils.softmax(attn_weights, dim=-1, onnx_trace=self.onnx_trace)
         attn_weights = attn_weights_float.type_as(attn_weights)
@@ -581,17 +579,12 @@ class LunarCausalAttention(nn.Module):
             assert incremental_state is not None
             incremental_state = self._set_input_buffer(incremental_state, saved_state)
 
-        assert list(attn.size()) == [bsz * self.num_heads, tgt_len, self.head_dim]
-        if self.onnx_trace and attn.size(1) == 1:
-            # when ONNX tracing a single decoder step (sequence length == 1)
-            # the transpose is a no-op copy before view, thus unnecessary
-            attn = attn.contiguous().view(tgt_len, bsz, embed_dim)
-        else:
-            attn = attn.transpose(0, 1).contiguous().view(tgt_len, bsz, embed_dim)
+        assert list(attn.size()) == [tgt_len, bsz * self.num_heads, self.head_dim]
+        attn = attn.view(tgt_len, bsz, embed_dim)
         attn = self.out_proj(attn)
         attn_weights: Optional[Tensor] = None
         if need_weights:
-            attn_weights = attn_weights_float.view(bsz, self.num_heads, tgt_len, plen).transpose(1, 0)
+            attn_weights = attn_weights_float.view(tgt_len, bsz, self.num_heads, plen).permute(2, 1, 0, 3)
             if not need_head_weights:
                 # average attention weights over heads
                 attn_weights = attn_weights.mean(dim=0)
@@ -666,45 +659,49 @@ def efficient_causal_attention_seq(x, y, z):
     """
     efficient causal attention operation
     Args:
-        x (Tensor): Tensor with shape `(batch, n, d1)`
-        y (Tensor): Tensor with shape `(batch, n, d1)`
-        z (Tensor): Tensor with shape '(batch, n, d2)`
+        x (Tensor): Tensor with shape `(n, batch, d1)`
+        y (Tensor): Tensor with shape `(n, batch, d1)`
+        z (Tensor): Tensor with shape `(n, batch, d2)`
 
     return:
+        f (Tensor): Tensor with shape `(n, batch, d2)`
     """
-    n = x.size(1)
+    n = x.size(0)
     rets = []
     accum_mat = 0
     for i in range(n):
-        xx = x[:, i:i + 1] # B x 1 x d1
-        yy = y[:, i:i + 1] # B x 1 x d1
-        zz = z[:, i:i + 1] # B x 1 x d2
+        xx = x[i] # B x d1
+        yy = y[i] # B x d1
+        zz = z[i] # B x d2
 
         # B x d1 x d2
-        accum_mat = accum_mat + torch.bmm(yy.transpose(1, 2), zz)
+        accum_mat = accum_mat + yy.unsqueeze(2) * zz.unsqueeze(1)
         # B x 1 x d2
-        rets.append(torch.bmm(xx, accum_mat).div(i + 1.))
-    # B x N x d2
-    return torch.cat(rets, dim=1)
+        ret = torch.bmm(xx.unsqueeze(1), accum_mat).div(i + 1.)
+        # 1 x B x d2
+        rets.append(ret.transpose(0, 1))
+    # N x B x d2
+    return torch.cat(rets, dim=0)
 
 
 def efficient_causal_attention_parallel(x, y, z):
     """
     efficient causal attention operation
     Args:
-        x (Tensor): Tensor with shape `(batch, n, d1)`
-        y (Tensor): Tensor with shape `(batch, n, d1)`
-        z (Tensor): Tensor with shape '(batch, n, d2)`
+        x (Tensor): Tensor with shape `(n, batch, d1)`
+        y (Tensor): Tensor with shape `(n, batch, d1)`
+        z (Tensor): Tensor with shape `(n, batch, d2)`
     return:
+        f (Tensor): Tensor with shape `(n, batch, d2)`
     """
-    bsz, n, d1 = x.size()
-    # (bsz, n, d1, 1) x (bsz, n, 1, d2) -> (bsz, n, d1, d2)
+    n, bsz, d1 = x.size()
+    # (n, bsz, d1, 1) x (n, bsz, 1, d2) -> (n, bsz, d1, d2)
     sum_mat = torch.matmul(y.unsqueeze(3), z.unsqueeze(2))
-    accum_mat = torch.cumsum(sum_mat, dim=1)
-    # (bsz, n, 1, d1) x (bsz, n, d1, d2) -> (bsz, n, 1, d2) -> (bsz, n, d2)
+    accum_mat = torch.cumsum(sum_mat, dim=0)
+    # (n, bsz, 1, d1) x (n, bsz, d1, d2) -> (n, bsz, 1, d2) -> (n, bsz, d2)
     res = torch.matmul(x.unsqueeze(2), accum_mat).squeeze(2)
-    # (1, n, 1)
-    length_div = torch.arange(1, n + 1, device=x.device).unsqueeze(0).unsqueeze(2)
+    # (n, 1, 1)
+    length_div = torch.arange(1, n + 1, device=x.device).unsqueeze(1).unsqueeze(2)
     res = res / length_div
     return res
 
@@ -713,17 +710,20 @@ def incremental_causal_attention(x, y, z, accum_mat, n):
     """
     efficient causal attention operation
     Args:
-        x (Tensor): Tensor with shape `(batch, 1, d1)`
-        y (Tensor): Tensor with shape `(batch, 1, d1)`
-        z (Tensor): Tensor with shape `(batch, 1, d2)`
+        x (Tensor): Tensor with shape `(1, batch, d1)`
+        y (Tensor): Tensor with shape `(1, batch, d1)`
+        z (Tensor): Tensor with shape `(1, batch, d2)`
         accum_mat (Tensor): Tensor with shape `(batch, d1, d2)`
         n (Tensor): number of steps with shape `(batch, )`
 
     return:
+        f (Tensor): Tensor with shape `(1, batch, d2)`
+        accum_mat (Tensor): Tensor with shape `(batch, d1, d2)`
     """
-    bsz = n.size(0)
+    bsz = n.size(1)
     # B x d1 x d2
-    accum_mat = accum_mat + torch.bmm(y.transpose(1, 2), z)
+    accum_mat = accum_mat + y.permute(1, 2, 0) * z.transpose(0, 1)
     # B x 1 x d2
-    out = torch.bmm(x, accum_mat).div(n.view(bsz, 1, 1))
-    return out, accum_mat
+    out = torch.bmm(x.transpose(0, 1), accum_mat).div(n.view(bsz, 1, 1))
+    # 1 x B x d2
+    return out.transpose(0, 1), accum_mat
