@@ -9,10 +9,10 @@ import torch.nn.functional as F
 
 from fairseq import metrics, utils
 from fairseq.criterions import FairseqCriterion, register_criterion
-import torch
 
-@register_criterion('cross_entropy')
-class CrossEntropyCriterion(FairseqCriterion):
+
+@register_criterion('sd_cross_entropy')
+class SDCrossEntropyCriterion(FairseqCriterion):
 
     def __init__(self, task, sentence_avg):
         super().__init__(task)
@@ -31,27 +31,22 @@ class CrossEntropyCriterion(FairseqCriterion):
         sample_size = sample['target'].size(0) if self.sentence_avg else sample['ntokens']
         logging_output = {
             'loss': loss.data,
-            'ntokens': 1,
+            'ntokens': sample['ntokens'],
             'nsentences': sample['target'].size(0),
-            'sample_size': 1,
+            'sample_size': sample_size,
         }
         return loss, sample_size, logging_output
 
     def compute_loss(self, model, net_output, sample, reduce=True):
         lprobs = model.get_normalized_probs(net_output, log_probs=True)
         lprobs = lprobs.view(-1, lprobs.size(-1))
-        target = model.get_targets(sample, net_output)[..., 1:-1]
-        mask = torch.zeros_like(target)
-        mask[..., 521:] = 1.
-
+        target = model.get_targets(sample, net_output).view(-1)
         loss = F.nll_loss(
             lprobs,
-            target.reshape((-1,)),
+            target,
             ignore_index=self.padding_idx,
-            reduction='none',
+            reduction='sum' if reduce else 'none',
         )
-        loss = (loss * mask.reshape((-1,))).mean()
-        
         return loss, loss
 
     @staticmethod

@@ -27,6 +27,7 @@ from fairseq.modules import (
     SinusoidalPositionalEmbedding,
     LunaDecoderLayer,
     LunaEncoderLayer,
+    LunaLMEncoderLayer
 )
 from fairseq.modules.quant_noise import quant_noise as apply_quant_noise_
 from torch import Tensor
@@ -901,6 +902,206 @@ class LunaDecoder(FairseqIncrementalDecoder):
                         ] = state_dict[k]
                         del state_dict[k]
 
+        return state_dict
+
+
+class LunaLMEncoder(FairseqIncrementalDecoder):
+    """
+    Luna encoder consisting of *args.encoder_layers* layers. Each layer
+    is a :class:`LunaEncoderLayer`.
+
+    Args:
+        args (argparse.Namespace): parsed command-line arguments
+        dictionary (~fairseq.data.Dictionary): encoding dictionary
+        embed_tokens (torch.nn.Embedding): input embedding
+    """
+
+    def __init__(self, args, dictionary, embed_tokens):
+        super().__init__(dictionary)
+        self.register_buffer("version", torch.Tensor([3]))
+
+        self.dropout_module = FairseqDropout(args.dropout, module_name=self.__class__.__name__)
+        self.dropword_module = FairseqFeatureDropout(args.word_dropout, module_name=self.__class__.__name__)
+        self.encoder_layerdrop = args.encoder_layerdrop
+
+        embed_dim = embed_tokens.embedding_dim
+        assert embed_dim == args.encoder_embed_dim, 'encoder embedding dim mismatch.'
+        self.padding_idx = embed_tokens.padding_idx
+        self.max_source_positions = args.max_source_positions
+
+        self.embed_tokens = embed_tokens
+
+        self.embed_scale = 1.0 if args.no_scale_embedding else math.sqrt(embed_dim)
+
+        self.embed_positions = (
+            PositionalEmbedding(
+                args.max_source_positions,
+                embed_dim,
+                self.padding_idx,
+                learned=args.encoder_learned_pos,
+            )
+            if not args.no_token_positional_embeddings
+            else None
+        )
+
+        assert not args.layernorm_embedding or not args.encoder_normalize_before
+
+        if args.layernorm_embedding:
+            self.layernorm_embedding = LayerNorm(embed_dim)
+            self.layernorm_porjected_embedding = LayerNorm(embed_dim)
+        else:
+            self.layernorm_embedding = None
+            self.layernorm_porjected_embedding = None
+
+        self.proj_len = args.projection_length
+        self.dynamic_projection = not args.fix_projection_length
+        self.projected_embeddings = Parameter(torch.Tensor(self.proj_len, embed_dim))
+        nn.init.normal_(self.projected_embeddings, mean=0., std=embed_dim ** -0.5)
+        if not args.no_token_positional_embeddings and not args.encoder_learned_pos:
+            projected_positions = get_sinusoidal_positional_embedding(self.proj_len, embed_dim)
+        else:
+            projected_positions = None
+        self.register_buffer('projected_positions', projected_positions)
+
+        if self.encoder_layerdrop > 0.0:
+            self.layers = LayerDropModuleList(p=self.encoder_layerdrop)
+        else:
+            self.layers = nn.ModuleList([])
+        self.layers.extend([self.build_encoder_layer(i, args) for i in range(args.encoder_layers)])
+        self.num_layers = len(self.layers)
+
+        if args.encoder_normalize_before:
+            self.layer_norm = LayerNorm(embed_dim)
+            self.proj_layer_norm = LayerNorm(embed_dim)
+        else:
+            self.layer_norm = None
+            self.proj_layer_norm = None
+        
+        self.output_projection = nn.Linear(
+            self.embed_tokens.weight.shape[1],
+            self.embed_tokens.weight.shape[0],
+            bias=False,
+        )
+        self.output_projection.weight = self.embed_tokens.weight
+
+    def build_encoder_layer(self, layer_id, args):
+        return LunaLMEncoderLayer(args, layer_id)
+
+    def forward_embedding(self, src_tokens):
+        # embed tokens and positions
+        x = embed = self.embed_scale * self.embed_tokens(src_tokens)
+        x = self.dropword_module(x)
+        if self.embed_positions is not None:
+            x = x + self.embed_positions(src_tokens)
+        if self.layernorm_embedding is not None:
+            x = self.layernorm_embedding(x)
+
+        return x, embed
+
+    def forward_projected_embedding(self, src_lengths):
+        max_len = src_lengths.max() if self.dynamic_projection else self.proj_len
+        px = proj_embed = self.embed_scale * self.projected_embeddings[:max_len]
+        if self.projected_positions is not None:
+            px = px + self.projected_positions[:max_len]
+        if self.layernorm_porjected_embedding is not None:
+            px = self.layernorm_porjected_embedding(px)
+
+        return px, proj_embed
+
+    def forward(self, src_tokens, src_lengths, return_all_hiddens: bool = False):
+        """
+        Args:
+            src_tokens (LongTensor): tokens in the source language of shape
+                `(batch, src_len)`
+            src_lengths (torch.LongTensor): lengths of each source sentence of
+                shape `(batch)`
+            return_all_hiddens (bool, optional): also return all of the
+                intermediate hidden states (default: False).
+
+        Returns:
+            namedtuple:
+                - **encoder_out** (Tensor): the last encoder layer's output of
+                  shape `(src_len, batch, embed_dim)`
+                - **encoder_padding_mask** (ByteTensor): the positions of
+                  padding elements of shape `(batch, src_len)`
+                - **encoder_embedding** (Tensor): the (scaled) embedding lookup
+                  of shape `(batch, src_len, embed_dim)`
+                - **encoder_states** (List[Tensor]): all intermediate
+                  hidden states of shape `(src_len, batch, embed_dim)`.
+                  Only populated if *return_all_hiddens* is True.
+        """
+        x, encoder_embedding = self.forward_embedding(src_tokens)
+        px, projected_embedding = self.forward_projected_embedding(src_lengths)
+
+        bsz = x.size(0)
+        len, dim = px.size()
+
+        # B x T x C -> T x B x C
+        x = x.transpose(0, 1)
+        # L x C -> L x B x C
+        px = px.unsqueeze(1).expand(len, bsz, dim)
+
+        x = self.dropout_module(x)
+        px = self.dropout_module(px)
+
+        # compute padding mask
+        encoder_padding_mask = src_tokens.eq(self.padding_idx)
+        if self.dynamic_projection:
+            pidx= torch.arange(len).unsqueeze(0).to(x.device)
+            encoder_projected_padding_mask = pidx.ge(src_lengths.unsqueeze(1))
+        else:
+            encoder_projected_padding_mask = None
+
+        encoder_states = [] if return_all_hiddens else None
+
+        # encoder layers
+        for layer in self.layers:
+            x, px = layer(x, px, encoder_padding_mask, encoder_projected_padding_mask)
+            if return_all_hiddens:
+                assert encoder_states is not None
+                encoder_states.append((x, px))
+
+        if self.layer_norm is not None:
+            x = self.layer_norm(x)
+            px = self.proj_layer_norm(px)
+        x = self.output_layer(x)
+        # T x B x C -> B x T x C
+        x = x.transpose(0, 1)
+        return x, None
+    
+    def output_layer(self, features):
+        """Project features to the vocabulary size."""
+        
+        return self.output_projection(features)
+
+    def max_positions(self):
+        """Maximum input length supported by the encoder."""
+        if self.embed_positions is None:
+            return self.max_source_positions
+        return min(self.max_source_positions, self.embed_positions.max_positions)
+
+    def upgrade_state_dict_named(self, state_dict, name):
+        """Upgrade a (possibly old) state dict for new versions of fairseq."""
+        if isinstance(self.embed_positions, SinusoidalPositionalEmbedding):
+            weights_key = "{}.embed_positions.weights".format(name)
+            if weights_key in state_dict:
+                print("deleting {0}".format(weights_key))
+                del state_dict[weights_key]
+            state_dict[
+                "{}.embed_positions._float_tensor".format(name)
+            ] = torch.FloatTensor(1)
+        for i in range(self.num_layers):
+            # update layer norms
+            self.layers[i].upgrade_state_dict_named(
+                state_dict, "{}.layers.{}".format(name, i)
+            )
+
+        version_key = "{}.version".format(name)
+        if utils.item(state_dict.get(version_key, torch.Tensor([1]))[0]) < 2:
+            # earlier checkpoints did not normalize after the stack of layers
+            self.layer_norm = None
+            self.normalize = False
+            state_dict[version_key] = torch.Tensor([1])
         return state_dict
 
 

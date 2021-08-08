@@ -464,6 +464,7 @@ class FairseqLanguageModel(BaseFairseqModel):
                 - the decoder's output of shape `(batch, seq_len, vocab)`
                 - a dictionary with any model-specific outputs
         """
+        src_tokens = src_tokens[..., 1:-1]
         return self.decoder(src_tokens, **kwargs)
 
     def forward_decoder(self, prev_output_tokens, **kwargs):
