@@ -361,7 +361,6 @@ class LunaLMEncoderLayer(nn.Module):
 
         self.self_attn = self.build_self_attention(self.embed_dim, args)
         self.self_attn_layer_norm = LayerNorm(self.embed_dim)
-        self.self_atten_proj_layer_norm = LayerNorm(self.embed_dim)
 
         self.activation_fn = utils.get_activation_fn(activation=getattr(args, "activation_fn", "relu"))
         activation_dropout_p = getattr(args, "activation_dropout", 0)
@@ -424,7 +423,6 @@ class LunaLMEncoderLayer(nn.Module):
         # apply prev layer norm
         if self.normalize_before:
             x = self.self_attn_layer_norm(x)
-            px = self.self_atten_proj_layer_norm(px)
 
         x, attn = self.self_attn(query=x, pquery=px,
                                  key_padding_mask=encoder_padding_mask,
@@ -437,15 +435,12 @@ class LunaLMEncoderLayer(nn.Module):
         #                           pcontext_padding_mask=encoder_projected_padding_mask)
         # apply dropout
         x = self.dropout_module(x)
-        px = self.dropout_module(px)
         # residual
         x = residual + x
-        px = presidual + px
 
         # apply post layer norm
         if not self.normalize_before:
             x = self.self_attn_layer_norm(x)
-            px = self.self_atten_proj_layer_norm(px)
 
         #######################################################################
         # Feed-Forward Network

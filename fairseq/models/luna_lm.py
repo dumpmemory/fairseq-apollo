@@ -217,7 +217,7 @@ def base_lm_architecture(args):
 @register_model_architecture('luna_lm', 'luna_lm_sd')
 def transformer_lm_sd(args):
     args.max_source_positions = getattr(args, 'max_source_positions', 1025)
-    args.encoder_layers = getattr(args, 'encoder_layers', 1)
+    args.encoder_layers = getattr(args, 'encoder_layers', 2)
     args.encoder_embed_dim = getattr(args, 'encoder_embed_dim', 256)
     args.encoder_ffn_embed_dim = getattr(args, 'encoder_ffn_embed_dim', 1024)
     args.encoder_attention_heads = getattr(args, 'encoder_attention_heads', 4)

@@ -1056,14 +1056,13 @@ class LunaLMEncoder(FairseqIncrementalDecoder):
 
         # encoder layers
         for layer in self.layers:
-            x, px = layer(x, px, encoder_padding_mask, encoder_projected_padding_mask)
+            x, _ = layer(x, px, encoder_padding_mask, encoder_projected_padding_mask)
             if return_all_hiddens:
                 assert encoder_states is not None
                 encoder_states.append((x, px))
 
         if self.layer_norm is not None:
             x = self.layer_norm(x)
-            px = self.proj_layer_norm(px)
         x = self.output_layer(x)
         # T x B x C -> B x T x C
         x = x.transpose(0, 1)
