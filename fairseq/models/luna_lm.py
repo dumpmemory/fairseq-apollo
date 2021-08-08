@@ -10,7 +10,7 @@ from fairseq.models import (
     register_model_architecture,
 )
 from fairseq.models.transformer import Embedding
-from fairseq.models.luna import LunaLMEncoder
+from fairseq.models.luna import LunaLMEncoder, LunaLMDecoder
 from fairseq.modules import (
     AdaptiveInput,
     CharacterTokenEmbedder,
@@ -158,7 +158,7 @@ class TransformerLanguageModel(FairseqLanguageModel):
                 args.adaptive_softmax_cutoff, args.adaptive_input_cutoff)
             assert args.decoder_input_dim == args.decoder_output_dim
 
-        decoder = LunaLMEncoder(
+        decoder = LunaLMDecoder(
             args, task.target_dictionary, embed_tokens
         )
         return cls(decoder)
@@ -176,8 +176,8 @@ def base_lm_architecture(args):
     args.encoder_layers = getattr(args, "encoder_layers", 6)
     args.encoder_attention_heads = getattr(args, "encoder_attention_heads", 8)
     args.encoder_projected_attention_heads = getattr(args, "encoder_projected_attention_heads", args.encoder_attention_heads)
-    args.encoder_learned_pos = getattr(args, "encoder_learned_pos", True)
-    args.encoder_normalize_before = getattr(args, "encoder_normalize_before", False)
+    args.encoder_learned_pos = getattr(args, "encoder_learned_pos", False)
+    args.encoder_normalize_before = getattr(args, "encoder_normalize_before", True)
 
     args.decoder_embed_path = getattr(args, "decoder_embed_path", None)
     args.decoder_embed_dim = getattr(args, "decoder_embed_dim", args.encoder_embed_dim)
@@ -217,10 +217,10 @@ def base_lm_architecture(args):
 @register_model_architecture('luna_lm', 'luna_lm_sd')
 def transformer_lm_sd(args):
     args.max_source_positions = getattr(args, 'max_source_positions', 1025)
-    args.encoder_layers = getattr(args, 'encoder_layers', 2)
-    args.encoder_embed_dim = getattr(args, 'encoder_embed_dim', 256)
-    args.encoder_ffn_embed_dim = getattr(args, 'encoder_ffn_embed_dim', 1024)
-    args.encoder_attention_heads = getattr(args, 'encoder_attention_heads', 4)
-    args.encoder_projected_attention_heads = getattr(args, "encoder_projected_attention_heads", 4)
+    args.decoder_layers = getattr(args, 'decoder_layers', 2)
+    args.decoder_embed_dim = getattr(args, 'decoder_embed_dim', 256)
+    args.decoder_ffn_embed_dim = getattr(args, 'decoder_ffn_embed_dim', 1024)
+    args.decoder_attention_heads = getattr(args, 'decoder_attention_heads', 4)
+    args.decoder_projected_attention_heads = getattr(args, "decoder_projected_attention_heads", 4)
     args.projection_length = getattr(args, 'projection_length', 64)
     base_lm_architecture(args)
