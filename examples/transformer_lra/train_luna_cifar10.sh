@@ -16,10 +16,9 @@ mkdir -p ${SAVE}
 cp $0 ${SAVE}/run.sh
 
 CUDA_VISIBLE_DEVICES=0,1 python -u train.py ${DATA} \
-    --use-p \
-    --seed $RANDOM --use-p --ddp-backend c10d --fp16 \
+    --seed $RANDOM --ddp-backend c10d --fp16 \
     -a ${model} --task transformer_lra \
-    --encoder-projected-length $plen --find-unused-parameters \
+    --encoder-projection-length $plen --find-unused-parameters \
     --encoder-projected-attention-heads 8 --attention-dropout 0.1 \
     --best-checkpoint-metric accuracy --maximize-best-checkpoint-metric \
     --optimizer adam --lr 0.005 --dropout 0.3 --adam-betas '(0.9, 0.98)' --clip-norm 0.0 \

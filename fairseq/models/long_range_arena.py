@@ -1,8 +1,3 @@
-# Copyright (c) Facebook, Inc. and its affiliates.
-#
-# This source code is licensed under the MIT license found in the
-# LICENSE file in the root directory of this source tree.
-
 import logging
 
 import torch
@@ -29,8 +24,8 @@ from fairseq.models.luna import LunaEncoder
 logger = logging.getLogger(__name__)
 
 
-@register_model('transformer_lra')
-class TransformerLRAModel(FairseqEncoderModel):
+@register_model('long_range_arena')
+class LRAModel(FairseqEncoderModel):
     """
     Class for training a transformer for LRA tasks.
     """
@@ -57,6 +52,7 @@ class TransformerLRAModel(FairseqEncoderModel):
             bias=False
         )
         self.sen_rep_type = getattr(args, "sen_rep_type", "first")
+        self.layer_type = args.layer_type
 
         # if specified then apply bert initialization on the model. We need
         # to explictly call this to make sure that the output embeddings
@@ -143,7 +139,7 @@ class TransformerLRAModel(FairseqEncoderModel):
             choices=['first', 'mp']
         )
         parser.add_argument(
-            '--encoder-projected-length', type=int, metavar='N',
+            '--encoder-projection-length', type=int, metavar='N',
             help='projected length of encoder as key'
         )
         parser.add_argument(
@@ -158,20 +154,26 @@ class TransformerLRAModel(FairseqEncoderModel):
     def forward(self, sample):
         src_tokens = sample['net_input']['src_tokens']
         if self.use_p:
+            assert self.layer_type == 'luna'
             src_tokens = src_tokens[:, 1:]
         sentence_rep = self.encoder(src_tokens)
         if not self.use_p:
-            sentence_rep = sentence_rep[1]
+            if self.layer_type == 'transformer':
+                sentence_rep = sentence_rep[1]
+            elif self.layer_type == 'luna':
+                sentence_rep = sentence_rep[1][0]
         else:
-            sentence_rep = sentence_rep[2].mean(dim=0)
+            sentence_rep = sentence_rep[1][1].mean(dim=0)
         if 'net_input1' in sample:
             src1_tokens = sample['net_input1']
             sentence1_rep = self.encoder(src1_tokens)
             if not self.use_p:
-                sentence1_rep = sentence1_rep[1]
+                if self.layer_type == 'transformer':
+                    sentence1_rep = sentence1_rep[1]
+                elif self.layer_type == 'luna':
+                    sentence1_rep = sentence1_rep[1][0]
             else:
-                sentence1_rep = sentence1_rep[2].mean(dim=0)
-            # sentence1_rep = encoder_out1.encoder_out[0,...]
+                sentence1_rep = sentence1_rep[1][1].mean(dim=0)
             concat_rep = []
             concat_rep.append(sentence1_rep)
             concat_rep.append(sentence_rep)
@@ -243,7 +245,6 @@ class TransformerLRAEncoder(FairseqEncoder):
     def __init__(self, args, task):
         super().__init__(task.dictionary)
         self.args = args
-
         if args.layer_type == 'transformer':
             self.encoder = TransformerSentenceEncoder(
                 tie_layer_weights=getattr(args, 'tie_layer_weights', False),
@@ -261,7 +262,7 @@ class TransformerLRAEncoder(FairseqEncoder):
                 use_position_embeddings=True,
                 offset_positions_by_padding=True,
                 encoder_normalize_before=True,
-                apply_bert_init=True,
+                apply_bert_init=get_attrs(args, "apply_bert_init", False),
                 activation_fn=args.activation_fn,
                 learned_pos_embedding=True,
                 normalize_before=False,
@@ -270,7 +271,7 @@ class TransformerLRAEncoder(FairseqEncoder):
         else:
             self.encoder = LunaSentenceEncoder(
                 tie_layer_weights=getattr(args, 'tie_layer_weights', False),
-                projected_length=args.encoder_projected_length,
+                projection_length=args.encoder_projection_length,
                 padding_idx=task.dictionary.pad_index,
                 vocab_size=len(task.dictionary),
                 num_encoder_layers=args.encoder_layers,
@@ -285,11 +286,11 @@ class TransformerLRAEncoder(FairseqEncoder):
                 offset_positions_by_padding=True,
                 layernorm_embedding=True,
                 apply_bert_init=getattr(args, "apply_bert_init", False),
+                tie_kv=getattr(args, 'tie_kv', False),
                 activation_fn=args.activation_fn,
                 learned_pos_embedding=True,
                 embed_scale=None,
-                sen_rep_type=getattr(args, 'sen_rep_type', 'cls'),
-                no_scale_embedding=getattr(args, 'no_scale_embedding', True)
+                sen_rep_type=getattr(args, 'sen_rep_type', 'cls')
             )
     
     def forward(self, src_tokens):
@@ -353,7 +354,7 @@ def base_architecture(args):
     args.sentence_class_num = getattr(args, 'sentence_class_num', 2)
     args.sent_loss = getattr(args, 'sent_loss', True)
 
-    args.apply_bert_init = getattr(args, 'apply_bert_init', False)
+    args.apply_bert_init = getattr(args, 'apply_bert_init', True)
 
     args.activation_fn = getattr(args, 'activation_fn', 'gelu')
     args.classifier_layers = getattr(args, 'classifier_layers', 1)
@@ -371,14 +372,6 @@ def transformer_lra_listop(args):
     args.tie_layer_weights = getattr(args, 'tie_layer_weights', True)
     base_architecture(args)
 
-@register_model_architecture('transformer_lra', 'transformer_lra_usep_listop')
-def transformer_lra_listop(args):
-    args.use_p = getattr(args, 'use_p', True)
-    args.sentence_class_num = getattr(args, 'sentence_class_num', 10)
-    args.max_positions = getattr(args, 'max_positions', 2002)
-    args.tie_layer_weights = getattr(args, 'tie_layer_weights', True)
-    base_architecture(args)
-
 @register_model_architecture('transformer_lra', 'luna_lra_listop')
 def luna_lra_listop(args):
     args.sentence_class_num = getattr(args, 'sentence_class_num', 10)
@@ -389,7 +382,7 @@ def luna_lra_listop(args):
 
 @register_model_architecture('transformer_lra', 'transformer_lra_imdb')
 def transformer_lra_imdb_architecture(args):
-    args.max_positions = getattr(args, 'max_positions', 1002)
+    args.max_positions = getattr(args, 'max_positions', 4002)
     args.encoder_ffn_embed_dim = getattr(args, 'encoder_ffn_embed_dim', 1024)
     args.encoder_layers = getattr(args, 'encoder_layers', 4)
     args.encoder_embed_dim = getattr(args, 'encoder_embed_dim', 256)
@@ -416,7 +409,7 @@ def luna_lra_imdb_architecture(args):
 
 @register_model_architecture('transformer_lra', 'transformer_lra_aan')
 def transformer_lra_aan_architecture(args):
-    args.apply_bert_init = getattr(args, 'apply_bert_init', True)
+    args.apply_bert_init = getattr(args, 'apply_bert_init', False)
     args.max_positions = getattr(args, 'max_positions', 4002)
     args.encoder_ffn_embed_dim = getattr(args, 'encoder_ffn_embed_dim', 512)
     args.encoder_layers = getattr(args, 'encoder_layers', 4)
@@ -429,6 +422,7 @@ def transformer_lra_aan_architecture(args):
 
 @register_model_architecture('transformer_lra', 'luna_lra_aan')
 def luna_lra_aan_architecture(args):
+    args.apply_bert_init = getattr(args, 'apply_bert_init', False)
     args.layer_type = getattr(args, 'layer_type', 'luna')
     transformer_lra_aan_architecture(args)
 
@@ -450,11 +444,11 @@ def transformer_lra_cifar10(args):
 @register_model_architecture('transformer_lra', 'luna_lra_cifar10')
 def luna_lra_cifar10(args):
     args.layer_type = getattr(args, 'layer_type', 'luna')
-    args.no_scale_embedding = getattr(args, "no_scale_embedding", False)
     transformer_lra_cifar10(args)
 
 @register_model_architecture('transformer_lra', 'transformer_lra_pf32')
 def transformer_lra_pf32(args):
+    args.apply_bert_init = getattr(args, 'apply_bert_init', False)
     args.encoder_ffn_embed_dim = getattr(args, 'encoder_ffn_embed_dim', 128)
     args.encoder_layers = getattr(args, 'encoder_layers', 1)
     args.encoder_embed_dim = getattr(args, 'encoder_embed_dim', 128)
@@ -471,6 +465,7 @@ def transformer_lra_pf32(args):
 
 @register_model_architecture('transformer_lra', 'luna_lra_pf32')
 def luna_lra_pf32(args):
+    args.apply_bert_init = getattr(args, 'apply_bert_init', False)
     # args.dropout = getattr(args, 'dropout', 0.2)
     # args.attention_dropout = getattr(args, 'attention_dropout', 0.2)
     args.layer_type = getattr(args, 'layer_type', 'luna')

@@ -20,7 +20,7 @@ CUDA_VISIBLE_DEVICES=0,1 python -u train.py ${DATA} \
     --seed $RANDOM --ddp-backend c10d --fp16 --find-unused-parameters \
     -a ${model} --task transformer_lra \
     --optimizer adam --lr 0.0005 --adam-betas '(0.9, 0.98)' --clip-norm 0.0 \
-    --encoder-projected-length $plen \
+    --encoder-projection-length $plen \
     --best-checkpoint-metric accuracy --maximize-best-checkpoint-metric \
     --encoder-projected-attention-heads 4 \
     --batch-size 16 --sentence-avg --update-freq 1 \
