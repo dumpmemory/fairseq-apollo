@@ -11,9 +11,8 @@ import torch.nn as nn
 from fairseq import utils
 from fairseq.modules import (
     LayerNorm,
-    MultiheadAttention
+    MultiheadAttention,
 )
-from fairseq.modules.multihead_linear_attention import MultiheadLinearAttention
 from fairseq.modules.quant_noise import quant_noise
 from fairseq.modules.fairseq_dropout import FairseqDropout
 
@@ -61,7 +60,6 @@ class TransformerSentenceEncoderLayer(nn.Module):
             q_noise=q_noise,
             qn_block_size=qn_block_size,
         )
-        # self.self_attn = self.build_informer_attention(self.embedding_dim)
 
         # layer norm associated with the self attention layer
         self.self_attn_layer_norm = LayerNorm(self.embedding_dim, export=export)
@@ -108,25 +106,6 @@ class TransformerSentenceEncoderLayer(nn.Module):
             self_attention=True,
             q_noise=q_noise,
             qn_block_size=qn_block_size,
-        )
-    
-    def build_informer_attention(
-        self,
-        embed_dim,
-        ):
-        max_length = 1000
-        return MultiheadLinearAttention(
-            embed_dim,
-            4,
-            dropout=0.1,
-            self_attention=True,
-            q_noise=0,
-            qn_block_size=8,
-            compressed=max_length//250,
-            max_seq_len=max_length,
-            shared_kv_compressed=1,
-            shared_compress_layer=None,
-            freeze_compress=0,
         )
 
     def forward(

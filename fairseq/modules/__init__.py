@@ -39,7 +39,6 @@ from .luna_layer import LunaEncoderLayer, LunaDecoderLayer
 from .moon_layer import MoonDecoderLayer, MoonEncoderLayer
 from .vggblock import VGGBlock
 from .luna_sentence_encoder import LunaSentenceEncoder
-from .multihead_linear_attention import MultiheadLinearAttention
 
 __all__ = [
     'AdaptiveInput',
@@ -67,7 +66,6 @@ __all__ = [
     'LightweightConv',
     'LinearizedConvolution',
     'MultiheadAttention',
-    'MultiheadLinearAttention',
     'LinearMultiheadAttention',
     'LunarMultiheadAttention',
     'LunarCausalAttention',
