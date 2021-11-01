@@ -306,8 +306,8 @@ class LunaSentenceEncoder(nn.Module):
             self.layers = LayerDropModuleList(p=self.layerdrop)
         else:
             self.layers = nn.ModuleList([])
-        self.num_layers = 1 if self.tie_layer_weights else num_encoder_layers
-        
+        self.num_layers = num_encoder_layers
+        real_num_layes = 1 if self.tie_layer_weights else num_encoder_layers
         self.layers.extend([
             self.build_luna_sentence_encoder_layer(
                 embedding_dim=self.embedding_dim,
@@ -324,7 +324,7 @@ class LunaSentenceEncoder(nn.Module):
                 q_noise=q_noise,
                 qn_block_size=qn_block_size,
             )
-            for _ in range(self.num_layers)
+            for _ in range(real_num_layes)
         ])
 
         assert not layernorm_embedding or not normalize_before
@@ -477,21 +477,13 @@ class LunaSentenceEncoder(nn.Module):
         if not last_state_only:
             inner_states.append((x, px))
 
-        # for layer in self.layers:
-        #     x, px, _ = layer(x, px,
-        #                      x_padding_mask=x_padding_mask,
-        #                      px_padding_mask=px_padding_mask)
-        #     if not last_state_only:
-        #         inner_states.append((x, px))
-        
-
         for i in range(self.num_layers):
             if self.tie_layer_weights:
                 x, px, _ = self.layers[0](x, px,
                              x_padding_mask=x_padding_mask,
                              px_padding_mask=px_padding_mask)
             else:
-                x, px, _ = self.layers[0](x, px,
+                x, px, _ = self.layers[i](x, px,
                              x_padding_mask=x_padding_mask,
                              px_padding_mask=px_padding_mask)
             if not last_state_only:

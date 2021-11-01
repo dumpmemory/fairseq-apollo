@@ -24,7 +24,7 @@ from fairseq.models.luna import LunaEncoder
 logger = logging.getLogger(__name__)
 
 
-@register_model('long_range_arena')
+@register_model('lra')
 class LRAModel(FairseqEncoderModel):
     """
     Class for training a transformer for LRA tasks.
@@ -191,24 +191,6 @@ class LRAModel(FairseqEncoderModel):
     def max_positions(self):
         """Maximum output length supported by the encoder."""
         return self._max_positions
-
-    # def upgrade_state_dict_named(self, state_dict, name):
-        # if isinstance(
-        #         self.encoder.embed_positions,
-        #         SinusoidalPositionalEmbedding
-        # ):
-        #     state_dict[
-        #         name + '.sentence_encoder.embed_positions._float_tensor'
-        #     ] = torch.FloatTensor(1)
-        # if not self.load_softmax:
-        #     for k in list(state_dict.keys()):
-        #         if (
-        #             "embed_out.weight" in k or
-        #             "sentence_projection_layer.weight" in k or
-        #             "lm_output_learned_bias" in k
-        #         ):
-        #             del state_dict[k]
-        # return state_dict
     
     @classmethod
     def build_embedding(cls, args, dictionary, embed_dim, path=None):
@@ -262,7 +244,7 @@ class TransformerLRAEncoder(FairseqEncoder):
                 use_position_embeddings=True,
                 offset_positions_by_padding=True,
                 encoder_normalize_before=True,
-                apply_bert_init=get_attrs(args, "apply_bert_init", False),
+                apply_bert_init=getattr(args, "apply_bert_init", False),
                 activation_fn=args.activation_fn,
                 learned_pos_embedding=True,
                 normalize_before=False,
@@ -297,44 +279,7 @@ class TransformerLRAEncoder(FairseqEncoder):
 
         return self.encoder(src_tokens)
 
-    # def forward(self, src_tokens, features_only=False, return_all_hiddens=False, masked_tokens=None, **unused):
-    #     """
-    #     Args:
-    #         src_tokens (LongTensor): input tokens of shape `(batch, src_len)`
-    #         features_only (bool, optional): skip LM head and just return
-    #             features. If True, the output will be of shape
-    #             `(batch, src_len, embed_dim)`.
-    #         return_all_hiddens (bool, optional): also return all of the
-    #             intermediate hidden states (default: False).
-
-    #     Returns:
-    #         tuple:
-    #             - the LM output of shape `(batch, src_len, vocab)`
-    #             - a dictionary of additional data, where 'inner_states'
-    #               is a list of hidden states. Note that the hidden
-    #               states have shape `(src_len, batch, vocab)`.
-    #     """
-    #     x, extra = self.extract_features(src_tokens, return_all_hiddens=return_all_hiddens)
-    #     if not features_only:
-    #         x = self.output_layer(x, masked_tokens=masked_tokens)
-    #     return x, extra
-
-    # def extract_features(self, src_tokens, return_all_hiddens=False, **unused):
-    #     inner_states, _ = self.sentence_encoder(
-    #         src_tokens,
-    #         last_state_only=not return_all_hiddens,
-    #     )
-    #     features = inner_states[-1].transpose(0, 1)  # T x B x C -> B x T x C
-    #     return features, {'inner_states': inner_states if return_all_hiddens else None}
-
-    # def output_layer(self, features, masked_tokens=None, **unused):
-    #     return self.lm_head(features, masked_tokens)
-
-    # def max_positions(self):
-    #     """Maximum output length supported by the encoder."""
-    #     return self.args.max_positions
-
-@register_model_architecture('transformer_lra', 'transformer_lra')
+@register_model_architecture('lra', 'lra')
 def base_architecture(args):
     args.dropout = getattr(args, 'dropout', 0.1)
     args.attention_dropout = getattr(args, 'attention_dropout', 0.1)
@@ -365,14 +310,14 @@ def base_architecture(args):
     args.classifier_in_dim = getattr(args, "classifier_in_dim", args.encoder_embed_dim)
 
 
-@register_model_architecture('transformer_lra', 'transformer_lra_listop')
+@register_model_architecture('lra', 'transformer_lra_listop')
 def transformer_lra_listop(args):
     args.sentence_class_num = getattr(args, 'sentence_class_num', 10)
     args.max_positions = getattr(args, 'max_positions', 2002)
     args.tie_layer_weights = getattr(args, 'tie_layer_weights', True)
     base_architecture(args)
 
-@register_model_architecture('transformer_lra', 'luna_lra_listop')
+@register_model_architecture('lra', 'luna_lra_listop')
 def luna_lra_listop(args):
     args.sentence_class_num = getattr(args, 'sentence_class_num', 10)
     args.max_positions = getattr(args, 'max_positions', 2001)
@@ -380,7 +325,7 @@ def luna_lra_listop(args):
     args.layer_type = getattr(args, 'layer_type', 'luna')
     base_architecture(args)
 
-@register_model_architecture('transformer_lra', 'transformer_lra_imdb')
+@register_model_architecture('lra', 'transformer_lra_imdb')
 def transformer_lra_imdb_architecture(args):
     args.max_positions = getattr(args, 'max_positions', 4002)
     args.encoder_ffn_embed_dim = getattr(args, 'encoder_ffn_embed_dim', 1024)
@@ -391,23 +336,23 @@ def transformer_lra_imdb_architecture(args):
     args.classifier_out_dim = getattr(args, 'classifier_out_dim', 1024)
     base_architecture(args)
 
-@register_model_architecture('transformer_lra', 'transformer_lra_imdb_eff')
+@register_model_architecture('lra', 'transformer_lra_imdb_eff')
 def transformer_lra_imdb_eff_architecture(args):
     args.max_positions = getattr(args, 'max_positions', 1000)
     transformer_lra_imdb_architecture(args)
 
-@register_model_architecture('transformer_lra', 'luna_lra_imdb')
+@register_model_architecture('lra', 'luna_lra_imdb')
 def luna_lra_imdb_architecture(args):
     args.layer_type = getattr(args, 'layer_type', 'luna')
     transformer_lra_imdb_architecture(args)
 
-@register_model_architecture('transformer_lra', 'luna_lra_imdb_eff')
+@register_model_architecture('lra', 'luna_lra_imdb_eff')
 def luna_lra_imdb_architecture(args):
     args.max_positions = getattr(args, 'max_positions', 2000)
     args.layer_type = getattr(args, 'layer_type', 'luna')
     transformer_lra_imdb_architecture(args)
 
-@register_model_architecture('transformer_lra', 'transformer_lra_aan')
+@register_model_architecture('lra', 'transformer_lra_aan')
 def transformer_lra_aan_architecture(args):
     args.apply_bert_init = getattr(args, 'apply_bert_init', False)
     args.max_positions = getattr(args, 'max_positions', 4002)
@@ -420,13 +365,13 @@ def transformer_lra_aan_architecture(args):
     args.classifier_in_dim = getattr(args, 'classifier_in_dim', args.encoder_embed_dim * 2)
     base_architecture(args)
 
-@register_model_architecture('transformer_lra', 'luna_lra_aan')
+@register_model_architecture('lra', 'luna_lra_aan')
 def luna_lra_aan_architecture(args):
     args.apply_bert_init = getattr(args, 'apply_bert_init', False)
     args.layer_type = getattr(args, 'layer_type', 'luna')
     transformer_lra_aan_architecture(args)
 
-@register_model_architecture('transformer_lra', 'transformer_lra_cifar10')
+@register_model_architecture('lra', 'transformer_lra_cifar10')
 def transformer_lra_cifar10(args):
     args.encoder_ffn_embed_dim = getattr(args, 'encoder_ffn_embed_dim', 128)
     args.encoder_layers = getattr(args, 'encoder_layers', 1)
@@ -436,17 +381,14 @@ def transformer_lra_cifar10(args):
     args.classifier_out_dim = getattr(args, 'classifier_out_dim', 128)
     args.sentence_class_num = getattr(args, 'sentence_class_num', 10)
     args.max_positions = getattr(args, 'max_positions', 1024)
-    # args.dropout = getattr(args, 'dropout', 0.3)
-    # args.attention_dropout = getattr(args, 'attention_dropout', 0.1)
-    # args.tie_layer_weights = getattr(args, 'tie_layer_weights', True)
     base_architecture(args)
 
-@register_model_architecture('transformer_lra', 'luna_lra_cifar10')
+@register_model_architecture('lra', 'luna_lra_cifar10')
 def luna_lra_cifar10(args):
     args.layer_type = getattr(args, 'layer_type', 'luna')
     transformer_lra_cifar10(args)
 
-@register_model_architecture('transformer_lra', 'transformer_lra_pf32')
+@register_model_architecture('lra', 'transformer_lra_pf32')
 def transformer_lra_pf32(args):
     args.apply_bert_init = getattr(args, 'apply_bert_init', False)
     args.encoder_ffn_embed_dim = getattr(args, 'encoder_ffn_embed_dim', 128)
@@ -457,13 +399,10 @@ def transformer_lra_pf32(args):
     args.classifier_out_dim = getattr(args, 'classifier_out_dim', 256)
     args.sentence_class_num = getattr(args, 'sentence_class_num', 2)
     args.max_positions = getattr(args, 'max_positions', 1026)
-    # args.tie_layer_weights = getattr(args, 'tie_layer_weights', True)
-    # args.dropout = getattr(args, 'dropout', 0.2)
-    # args.attention_dropout = getattr(args, 'attention_dropout', 0.2)
     args.sen_rep_type = getattr(args, 'sen_rep_type', 'mp')
     base_architecture(args)
 
-@register_model_architecture('transformer_lra', 'luna_lra_pf32')
+@register_model_architecture('lra', 'luna_lra_pf32')
 def luna_lra_pf32(args):
     args.apply_bert_init = getattr(args, 'apply_bert_init', False)
     # args.dropout = getattr(args, 'dropout', 0.2)
@@ -471,7 +410,7 @@ def luna_lra_pf32(args):
     args.layer_type = getattr(args, 'layer_type', 'luna')
     transformer_lra_pf32(args)
 
-@register_model_architecture('transformer_lra', 'luna_lra_pf128')
+@register_model_architecture('lra', 'luna_lra_pf128')
 def luna_lra_pf32(args):
     args.max_positions = getattr(args, 'max_positions', 128*128+2)
     # args.dropout = getattr(args, 'dropout', 0.2)
