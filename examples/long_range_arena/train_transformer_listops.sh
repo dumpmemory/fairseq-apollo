@@ -17,7 +17,7 @@ cp $0 ${SAVE}/run.sh
 
 CUDA_VISIBLE_DEVICES=0,1 python -u train.py ${DATA} \
     --seed $RANDOM --ddp-backend c10d --fp16 \
-    -a ${model} --task sentence_prediction \
+    -a ${model} --task long_range_arena \
     --apply-bert-init  --num-classes 10 \
     --best-checkpoint-metric accuracy --maximize-best-checkpoint-metric \
     --optimizer adam --lr 0.0001 --adam-betas '(0.9, 0.98)' --clip-norm 0.0 \

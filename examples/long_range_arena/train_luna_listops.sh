@@ -1,8 +1,6 @@
 #! /bin/bash
 
-split=0
-seeds=(1 11 65537 101 1999 2017)
-seed=${seeds[$split]}
+seed=1
 
 DATA=$1
 SAVE_ROOT=$2
@@ -16,12 +14,13 @@ mkdir -p ${SAVE}
 cp $0 ${SAVE}/run.sh
 
 CUDA_VISIBLE_DEVICES=0,1 python -u train.py ${DATA} \
-    --seed $RANDOM --ddp-backend c10d --fp16 --find-unused-parameters \
+    --seed $seed --ddp-backend c10d --fp16 --find-unused-parameters \
     -a ${model} --task transformer_lra \
     --optimizer adam --lr 0.0001 --adam-betas '(0.9, 0.98)' --clip-norm 0.0 \
     --encoder-projection-length ${plen} \
     --best-checkpoint-metric accuracy --maximize-best-checkpoint-metric \
     --encoder-projected-attention-heads 8 \
+    --encoder-layers 1 \
     --apply-bert-init  \
     --batch-size 16 --sentence-avg --update-freq 1 \
     --lr-scheduler inverse_sqrt --weight-decay 0.0001 \
